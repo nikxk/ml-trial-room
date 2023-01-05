@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# added 
+.vscode/
+MNIST_data/
+wrong_pred/
+saved-models/
