@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        devices=2,
+        devices=1,
         max_epochs=30,
         strategy=DDPStrategy(find_unused_parameters=False),
         logger=TensorBoardLogger(save_dir="logs", name="img_clf"),
