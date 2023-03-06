@@ -9,15 +9,24 @@ import torch_optimizer as optim
 
 from einops import rearrange, reduce
 
+import optuna
+import logging
+import sys
+
 from perceiver.model.core import InputAdapter, OutputAdapter, PerceiverEncoder, PerceiverDecoder, FourierPositionEncoding, TrainableQueryProvider
 
-dataset_loc = 'MNIST_data'
+from utils import *
+
+dataset_loc = 'MNIST_data/'
 
 def main():
-    train_loader, test_loader = get_mnist_dataset(batch_size=256)
+    train_loader, val_loader, test_loader = get_mnist_dataset(dataset_loc=dataset_loc, batch_size=64, num_workers=4)
 
     example: torch.Tensor = next(iter(train_loader))
-    num_classes: int = len(train_loader.dataset.classes)
+    num_classes: int = len(train_loader.dataset.dataset.classes)
+
+    loss_fn = nn.CrossEntropyLoss()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # initialize model
     model = mnistPerceiver(
@@ -31,53 +40,84 @@ def main():
         num_SA_layers=6,
         )
 
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.Lamb(model.parameters(), lr=1e-3)
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    num_batches = len(train_loader)
+    # model.load_state_dict(torch.load('mnist_perceiver.pt'))
 
     # train model
-    for epoch in range(10):
-        print(f'Epoch: {epoch}')
-        batch_idx = 0
-        pbar = tqdm(train_loader)
-        for batch in pbar:
-            pbar.set_description(f'Batch {batch_idx}/{num_batches} ')
-            batch_idx += 1
-            x, y = batch
-            x = x.to(device)
-            y = y.to(device)
+    optimizer = optim.Lamb(model.parameters(), lr=1e-3)
+    model = train_classifier(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        device=device,
+        num_epochs=100,
+        patience=3,
+        verbose=True
+        )
 
-            pred = model(x)
-            loss = loss_fn(pred, y)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        print(f' Loss: {loss.item()}', end='')
-
-        # test model
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for batch in test_loader:
-                x, y = batch
-                x = x.to(device)
-                y = y.to(device)
-
-                pred = model(x)
-                _, pred = torch.max(pred, dim=1)
-                total += y.size(0)
-                correct += (pred == y).sum().item()
-
-        print(f', Accuracy: {correct/total}')
+    # test model
+    test_loss, test_acc = evaluate_classifier(model=model, loader=test_loader, loss_fn=loss_fn, device=device)
+    print(f'--\nTest loss: {test_loss}, Test accuracy: {test_acc}')
 
     # save model
     torch.save(model.state_dict(), 'mnist_perceiver.pt')
 
+
+def objective(trial: optuna.trial.Trial):
+    lr = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
+    num_frequency_bands = trial.suggest_int('num_frequency_bands', 2, 14)
+    latent_size_pow = trial.suggest_int('latent_size_pow', 2, 4)
+    num_CA_blocks = trial.suggest_int('num_CA_blocks', 1, 3)
+    num_SA_layers = trial.suggest_int('num_SA_layers', 2, 6)
+
+    latent_size = 2**latent_size_pow
+
+    print(f'lr: {lr}, num_frequency_bands: {num_frequency_bands}, latent_size: {latent_size}, num_CA_blocks: {num_CA_blocks}, num_SA_layers: {num_SA_layers}')
+
+    train_loader, val_loader, test_loader = get_mnist_dataset(dataset_loc=dataset_loc, batch_size=64, num_workers=4)
+
+    example: torch.Tensor = next(iter(train_loader))
+    num_classes: int = len(train_loader.dataset.dataset.classes)
+
+    loss_fn = nn.CrossEntropyLoss()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # initialize model
+    model = mnistPerceiver(
+        image_shape = example[0].shape[1:],
+        num_classes = num_classes,
+        num_frequency_bands = num_frequency_bands,
+        latent_shape = (latent_size, latent_size), 
+        output_query_shape = (1, 8),
+        num_CA_blocks=num_CA_blocks,
+        num_SA_blocks=num_CA_blocks,
+        num_SA_layers=num_SA_layers,
+        )
+
+    # train model
+    optimizer = optim.Lamb(model.parameters(), lr=lr)
+    model = train_classifier(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        loss_fn=loss_fn,
+        device=device,
+        num_epochs=20,
+        patience=3,
+        verbose=True
+        )
+
+    # test model
+    test_loss, test_acc = evaluate_classifier(model=model, loader=test_loader, loss_fn=loss_fn, device=device)
+    print(f'--\nTest loss: {test_loss}, Test accuracy: {test_acc}')
+
+    # save the parameters to a csv file, append to the file if it already exists
+    with open('mnist_perceiver.csv', 'a') as f:
+        f.write(f'{lr},{num_frequency_bands},{latent_size},{num_CA_blocks},{num_SA_layers},{test_loss},{test_acc}\n')
+
+    return test_acc
 
 
 class ImageInputAdapter(InputAdapter):
@@ -167,16 +207,11 @@ class mnistPerceiver(nn.Module):
         return x
 
 
-def get_mnist_dataset(batch_size=32, num_workers=4, shuffle=True, pin_memory=True) -> Tuple[DataLoader, DataLoader]:
-    MNIST_transform=transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
-    train_dataset = datasets.MNIST(root=dataset_loc, train=True, download=True, transform=MNIST_transform)
-    test_dataset = datasets.MNIST(root=dataset_loc, train=False, download=True, transform=MNIST_transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=shuffle, pin_memory=pin_memory)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=shuffle, pin_memory=pin_memory)
-    return train_loader, test_loader
-    
 if __name__ == '__main__':
-    main()
+    # main()
+
+    optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
+    study_name = "mnist_perceiver_classification_study1"  # Unique identifier of the study.
+    storage_name = "sqlite:///{}.db".format(study_name)
+    study = optuna.create_study(study_name=study_name, storage=storage_name, load_if_exists=True, direction='maximize')
+    study.optimize(objective, n_trials=100)
